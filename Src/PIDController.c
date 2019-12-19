@@ -2,7 +2,7 @@
 
 
 float defaultErrorFunc(float a, float b) {
-	return a - b;
+	return b - a;
 }
 
 /**
@@ -27,6 +27,7 @@ void InitPID(PIDProp *props, float newKp, float newKi, float newKd, float newMax
 	props->pointValue = 0;
 	props->lastInput = 0;
 	props->lastOutput = 0;
+	props->lastError = 0;
 	props->enabled = enabledON;
 	props->mode = 0;
 	props->lasttime = HAL_GetTick();
@@ -75,38 +76,34 @@ void setPoint(PIDProp *props, float value) {
  *
  * @param props		:	pointer to a settings structure
  * @param value		:	curret value of controlled model
+ * @param dt		: 	elapsed time interval
  *
  * @retval Manipulating output value
  */
-float calc(PIDProp *props, float inputValue) {
-	if (!props->enabled) return props->lastOutput;
-	if (HAL_GetTick() - props->lasttime < UPTIME) return props->lastOutput;
-	props->lastdelay = HAL_GetTick() - props->lasttime;
+float calc(PIDProp *props, float inputValue, float dt) {
+	//if (!props->enabled) return props->lastOutput;
+	//if (HAL_GetTick() - props->lasttime < UPTIME) return props->lastOutput;
 
-	float error = props->errorFunc(props->pointValue, inputValue);
+	//float error = props->errorFunc(props->pointValue, inputValue);
+	float error = inputValue - props->pointValue;
 	float output = 0;
 
-	props->integralSum += props->Ki * error / props->lastdelay;
-	if (props->mode == 1) props->integralSum -= props->Kp * error;
+	props->integralSum += error * dt * props->Ki;
+	//if (props->mode == 1) props->integralSum -= props->Kp * error;
 	if (props->integralSum > props->maxOutput) props->integralSum = props->maxOutput;
 	if (props->integralSum < props->minOutput) props->integralSum = props->minOutput;
 
-	// Add proportional part
-	if (props->mode == 0) output = error * props->Kp;
-	if (props->mode == 1) output = 0;
+	// Episilon dropout
+	//if (abs(error) < 0.5f) props->integralSum = 0;
 
-	// Add integral part
-	output += props->integralSum;
-
-	// Add differential part
-	output -= (inputValue - props->lastInput) * props->Kd;
+	output = error * props->Kp + props->integralSum  + (error - props->lastError) * props->Kd / dt;
+	//if (props->mode == 1) output = 0;
 
 	if (output > props->maxOutput) output = props->maxOutput;
 	if (output < props->minOutput) output = props->minOutput;
 
-	props->lastInput = inputValue;
 	props->lastOutput = output;
-	props->lasttime = HAL_GetTick();
+	props->lastError = error;
 
 	return output;
 }
@@ -141,6 +138,11 @@ void resetController(PIDProp *prop) {
 	prop->lastOutput = 0;
 	prop->lastInput = 0;
 	prop->pointValue = 0;
+	prop->lasttime = HAL_GetTick();
+}
+
+void dropISum(PIDProp *prop) {
+	prop->integralSum = 0;
 }
 
 

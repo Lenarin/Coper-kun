@@ -207,6 +207,9 @@ typedef struct imuStruct{
 	float yaw;
 	float pitch;
 	float roll;
+	float lin_ax;
+	float lin_ay;
+	float lin_az;
 } imuStruct;
 
 enum Mscale {
@@ -356,10 +359,14 @@ char readByte(uint8_t subAddress);
 void readBytes(uint8_t subAddress, uint8_t count, uint8_t * dest);
 HAL_StatusTypeDef writeByte(uint8_t subAddress, uint8_t data);
 void MPU9250SetConnection(I2C_HandleTypeDef* I2Cx, SD_Device DeviceNumber);
-void CalcGyroDrift();
+void gyroCalibration();
+void accelCalibration();
 imuStruct* imuGetPtr();
 void magcalMPU9250();
 SD_Result initAK8963();
+void MPU9250_TakeAndCalcData(float dt);
+
+float gx_out, gy_out, gz_out;
 
 
 #endif /* DRIVERS_MYLIB_SD_HAL_H_ */

@@ -50,6 +50,8 @@ I2C_HandleTypeDef hi2c1;
 TIM_HandleTypeDef htim2;
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
+TIM_HandleTypeDef htim5;
+TIM_HandleTypeDef htim9;
 
 /* USER CODE BEGIN PV */
 uint8_t  rc_switch3 = SWITCH_OFF;
@@ -61,6 +63,17 @@ uint32_t yaw = 1500;;
 uint32_t pitch = 1500;;
 uint32_t roll = 1500;
 
+float time_elapsed = 0;
+
+uint16_t last_throttle = 0;
+float failsafe_timestamp;
+
+float Roll_Kp, Pitch_Kp, Yaw_Kp;
+
+float debug_yaw, debug_roll, debug_pitch;
+
+float altitude;
+
 anglePoints aPoints;
 
 float outputs[3];
@@ -68,9 +81,6 @@ int pulse_esc1 = 1000;
 int pulse_esc2 = 1000;
 int pulse_esc3 = 1000;
 int pulse_esc4 = 1000;
-
-
-uint32_t timestamp;
 
 States currentState = STATE_LAUNCHING;
 
@@ -85,12 +95,15 @@ static void MX_TIM3_Init(void);
 static void MX_TIM4_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_I2C1_Init(void);
+static void MX_TIM5_Init(void);
+static void MX_TIM9_Init(void);
 /* USER CODE BEGIN PFP */
 float yawErrorFunc(float a, float b);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
 
@@ -162,8 +175,8 @@ int initAll() {
 	if(SelfTest[0] < 1.0f && SelfTest[1] < 1.0f && SelfTest[2] < 1.0f && SelfTest[3] < 1.0f && SelfTest[4] < 1.0f && SelfTest[5] < 1.0f)
 	{
 		resetMPU9250();
-		calibrateMPU9250();
-		SD_MPUInit(SD_Accelerometer_2G, SD_Gyroscope_250s);
+		//calibrateMPU9250();
+		SD_MPUInit(SD_Accelerometer_4G, SD_Gyroscope_500s);
 		initAK8963();
 #if DEBUG == 1
 		printf("MPU9250 initialized for active data mode....\n");
@@ -185,7 +198,9 @@ int initAll() {
 	HAL_Delay(100);
 	// BMP280
 	bmp280_init_default_params(&bmp280.params);
-	bmp280.params.standby = BMP280_STANDBY_62;
+	bmp280.params.oversampling_pressure = BMP280_ULTRA_HIGH_RES;
+	bmp280.params.oversampling_temperature = BMP280_LOW_POWER;
+	bmp280.params.standby = BMP280_STANDBY_05;
 	bmp280.params.filter = BMP280_FILTER_16;
 	bmp280.addr = BMP280_I2C_ADDRESS_0;
 	bmp280.i2c = &hi2c1;
@@ -204,12 +219,15 @@ int initAll() {
 
 
 	// Regulators
-	InitPID(&PIDPros[YAW],0.0f, 0.0f, 0.0f, 400.0f, -400.0f);
-	InitPID(&PIDPros[ROLL], 1.0f, 0.0f, 0.0f, 400.0f, -400.0f);
-	InitPID(&PIDPros[PITCH], 1.0f, 0.0f, 0.0f, 400.0f, -400.0f);
-
-	//Change Yaw error func
-	setErrorFunc(&PIDPros[YAW], yawErrorFunc);
+	InitPID(&PIDPros[YAW], 6.0f, 0.0f, 0.0f, 400.0f, -400.0f);
+	InitPID(&PIDPros[ROLL], 3.5f, 3.5f, 0.1f, 400.0f, -400.0f);
+	InitPID(&PIDPros[PITCH], 3.5f, 3.5f, 0.1f, 400.0f, -400.0f);
+	Roll_Kp = 2.0f;
+	Pitch_Kp = 2.0f;
+	Yaw_Kp = 1.0f;
+#if DEBUG == 1
+	printf("PID[ROLL] P I d %f %f %f \n", PIDPros[ROLL].Kp, PIDPros[ROLL].Ki, PIDPros[ROLL].Kd);
+#endif
 
 	// Input timers
 	HAL_TIM_IC_Start_IT(&htim3, TIM_CHANNEL_1); // throttle and yaw
@@ -218,10 +236,10 @@ int initAll() {
     HAL_TIM_IC_Start_IT(&htim4, TIM_CHANNEL_2);
 
     // Output times
-    HAL_TIM_OC_Start(&htim2, TIM_CHANNEL_1);
-    HAL_TIM_OC_Start(&htim2, TIM_CHANNEL_2);
-    HAL_TIM_OC_Start(&htim2, TIM_CHANNEL_3);
-    HAL_TIM_OC_Start(&htim2, TIM_CHANNEL_4);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+    HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_4);
 
     if (currentState == STATE_CALIBRATING) {
     	TIM2->CCR1 = 2000;
@@ -236,7 +254,10 @@ int initAll() {
     }
 
 
-    CalcGyroDrift();
+    HAL_Delay(500);
+    gyroCalibration();
+    //accelCalibrationEx();
+    accelCalibration();
 	return 0;
 }
 
@@ -246,7 +267,7 @@ void resetState() {
 	TIM2->CCR3 = 1000;
 	TIM2->CCR4 = 1000;
 
-	aPoints.yaw = 0;
+	aPoints.yaw = imuGetPtr()->yaw;
 	aPoints.roll = 0;
 	aPoints.pitch = 0;
 
@@ -257,13 +278,18 @@ void resetState() {
 
 void calcInputValues() {
 
+	//pitch += 30;
+	//roll += 10;
+
 	if (pitch > PITCH_UPPER_TRESHOLD ) {
-		aPoints.pitch = -(pitch - PITCH_UPPER_TRESHOLD) / MAX_PITCH_INPUT * MAX_PITCH_POINT;
+		aPoints.pitch = (pitch - PITCH_UPPER_TRESHOLD) / MAX_PITCH_INPUT * MAX_PITCH_POINT;
 	} else if (pitch < PITCH_BOTTOM_TRESHOLD) {
-		aPoints.pitch = -(pitch - PITCH_BOTTOM_TRESHOLD) / MAX_PITCH_INPUT * MAX_PITCH_POINT;
+		aPoints.pitch = (pitch - PITCH_BOTTOM_TRESHOLD) / MAX_PITCH_INPUT * MAX_PITCH_POINT;
 	} else {
 		aPoints.pitch = 0.0f;
 	}
+
+	//aPoints.pitch -= 10.0f;
 
 	if (roll > ROLL_UPPER_TRESHOLD ) {
 		aPoints.roll = -(roll - ROLL_UPPER_TRESHOLD) / MAX_ROLL_INPUT * MAX_ROLL_POINT;
@@ -272,6 +298,8 @@ void calcInputValues() {
 	} else {
 		aPoints.roll = 0.0f;
 	}
+
+	//aPoints.roll -= 5.0f;
 
 	/*
 	if (yaw > YAW_UPPER_TRESHOLD ) {
@@ -303,15 +331,15 @@ void calcInputValues() {
 }
 
 void checkState() {
-	if (throttle > 1100 && throttle < 1150) { // THROTTLE
-		if (roll > 1800)
+	if (throttle > 1000 && throttle < 1100) { // THROTTLE
+		if (roll > 1750)
 		{
 			resetState();
 			currentState = STATE_ON;
 			setPoint(&PIDPros[YAW], imuData.yaw);
 			changeLEDState();
 		}
-		if (roll < 1200)
+		if (roll < 1250)
 		{
 			resetState();
 			currentState = STATE_OFF;
@@ -323,6 +351,18 @@ void checkState() {
 		if (throttle > 1700 & roll > 1800) {
 			resetState();
 			currentState = STATE_CALIBRATING;
+			changeLEDState();
+		}
+	}
+
+	// falisafe implementation placeholder
+	if (last_throttle != throttle || currentState != STATE_ON) {
+		last_throttle = throttle;
+		failsafe_timestamp = HAL_GetTick();
+	} else {
+		if (HAL_GetTick() - failsafe_timestamp > FAILSAFE_TRESHOLD) {
+			resetState();
+			currentState = STATE_OFF;
 			changeLEDState();
 		}
 	}
@@ -354,31 +394,36 @@ void changeLEDState() {
 
 void calibrate() {
 	  while (currentState == STATE_CALIBRATING) {
-
-		  int esc = 1000 + ((throttle - 1065) / 660) * (1000);
-		  if (esc < 1000) esc = 1000;
-		  if (esc > 2000) esc = 2000;
-
-		  TIM2->CCR1 = throttle;
-		  TIM2->CCR2 = throttle;
-		  TIM2->CCR3 = throttle;
-		  TIM2->CCR4 = throttle;
+		  if (throttle > 1500) {
+			  TIM2->CCR1 = 2000;
+			  TIM2->CCR2 = 2000;
+			  TIM2->CCR3 = 2000;
+			  TIM2->CCR4 = 2000;
+		  }
+		  if (throttle < 1500) {
+			  TIM2->CCR1 = 1000;
+			  TIM2->CCR2 = 1000;
+			  TIM2->CCR3 = 1000;
+			  TIM2->CCR4 = 1000;
+		  }
 
 		  checkState();
 	  }
 }
 
+
 void static inline readAllData() {
 	// Get gyro and magnet meters
-	  if (readByte(INT_STATUS) & 0x01) {
-		  MPU9250_TakeAndCalcData();
-
+	  if (readByte(INT_STATUS)) {
+		  MPU9250_TakeAndCalcData((float)TIM9->CNT/ 1000000.0f);
+		  TIM9->CNT = 0;
 	  }
 	  MPU9250_CalcYPR();
 
 	  // Get BMP280 data
 	  if (!bmp280_is_measuring(&bmp280)) {
 		  bmp280_read_float_ex(&bmp280, &bmp_res);
+		  altitude = 44330 * (1.0 - pow((bmp_res.pressure / 100) / 1013.25, 0.1903));
 	  }
 }
 
@@ -389,8 +434,6 @@ void static inline readAllData() {
   * @retval int
   */
 int main(void)
-
-
 {
   /* USER CODE BEGIN 1 */
 
@@ -418,9 +461,10 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM2_Init();
   MX_I2C1_Init();
+  MX_TIM5_Init();
+  MX_TIM9_Init();
   /* USER CODE BEGIN 2 */
   // Try to init while no errors ocured
-  timestamp = HAL_GetTick();
   while(initAll() != 0) {HAL_Delay(100);};		// This must be first!!!!
   changeLEDState();
 
@@ -433,6 +477,9 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   //magcalMPU9250();
 
+  HAL_TIM_Base_Init(&htim9);
+HAL_TIM_Base_Start(&htim9);
+
   while (currentState == STATE_LAUNCHING) {
 	  checkState();
 	  readAllData();
@@ -440,8 +487,11 @@ int main(void)
 
   if (currentState == STATE_CALIBRATING) calibrate();
 
+
+
   while (1)
   {
+	  // Calculate regulator output next step
 	  readAllData();
 
 	  if (currentState == STATE_OFF) {
@@ -449,40 +499,60 @@ int main(void)
 	  } else if (currentState == STATE_ON) {
 		  calcInputValues();
 
+		  if (throttle < 1500) {
+			  dropISum(&PIDPros[PITCH]);
+			  dropISum(&PIDPros[ROLL]);
+		  }
+
 		  // Set target points
-		  setPoint(&PIDPros[YAW], aPoints.yaw);
-		  setPoint(&PIDPros[ROLL], aPoints.roll);
-		  setPoint(&PIDPros[PITCH], aPoints.pitch);
+		  setPoint(&PIDPros[YAW], -Yaw_Kp * yawErrorFunc(aPoints.yaw, imuGetPtr()->yaw));
+		  setPoint(&PIDPros[ROLL], -Roll_Kp * (aPoints.roll  - imuGetPtr()->roll));
+		  setPoint(&PIDPros[PITCH], -Pitch_Kp * (aPoints.pitch - imuGetPtr()->pitch));
 
-			  // Calculate regulator output next step
-		  outputs[YAW] = calc(&PIDPros[YAW], imuGetPtr()->yaw);
-		  outputs[ROLL] = calc(&PIDPros[ROLL], imuGetPtr()->roll);
-		  outputs[PITCH] = calc(&PIDPros[PITCH], imuGetPtr()->pitch);
+		  time_elapsed = (float)TIM5->CNT/ 1000000.0f;
 
-		  // Sum output pulses
-		  pulse_esc1 = throttle + outputs[ROLL] + outputs[PITCH] + outputs[YAW];
-		  pulse_esc2 = throttle + outputs[ROLL] - outputs[PITCH] - outputs[YAW];
-		  pulse_esc3 = throttle - outputs[ROLL] + outputs[PITCH] - outputs[YAW];
-		  pulse_esc4 = throttle - outputs[ROLL] - outputs[PITCH] + outputs[YAW];
+		  TIM5->CNT = 0;
+
+		  outputs[YAW] = calc(&PIDPros[YAW], gz_out, time_elapsed);
+		  outputs[ROLL] = calc(&PIDPros[ROLL], gy_out, time_elapsed);
+		  outputs[PITCH] = calc(&PIDPros[PITCH], -gx_out, time_elapsed);
+
+		  //debug_roll = outputs[ROLL];
+		  //debug_pitch = outputs[PITCH];
+		  //debug_yaw = outputs[YAW];
+
+		  if (throttle > 1080) {
+			  // Sum output pulses
+			  pulse_esc1 = throttle + outputs[ROLL] - outputs[PITCH] - outputs[YAW];
+			  pulse_esc2 = throttle + outputs[ROLL] + outputs[PITCH] + outputs[YAW];
+			  pulse_esc3 = throttle - outputs[ROLL] + outputs[PITCH] - outputs[YAW];
+			  pulse_esc4 = throttle - outputs[ROLL] - outputs[PITCH] + outputs[YAW];
+
+
+			  // Check output values
+			  if (pulse_esc1 > MAX_PULSE_OUTPUT) pulse_esc1 = MAX_PULSE_OUTPUT;
+			  if (pulse_esc1 < MIN_PULSE_OUTPUT) pulse_esc1 = MIN_PULSE_OUTPUT;
+			  if (pulse_esc2 > MAX_PULSE_OUTPUT) pulse_esc2 = MAX_PULSE_OUTPUT;
+			  if (pulse_esc2 < MIN_PULSE_OUTPUT) pulse_esc2 = MIN_PULSE_OUTPUT;
+			  if (pulse_esc3 > MAX_PULSE_OUTPUT) pulse_esc3 = MAX_PULSE_OUTPUT;
+			  if (pulse_esc3 < MIN_PULSE_OUTPUT) pulse_esc3 = MIN_PULSE_OUTPUT;
+			  if (pulse_esc4 > MAX_PULSE_OUTPUT) pulse_esc4 = MAX_PULSE_OUTPUT;
+			  if (pulse_esc4 < MIN_PULSE_OUTPUT) pulse_esc4 = MIN_PULSE_OUTPUT;
+
+			  TIM2->CCR1 = pulse_esc1;
+			  TIM2->CCR2 = pulse_esc2;
+			  TIM2->CCR3 = pulse_esc3;
+			  TIM2->CCR4 = pulse_esc4;
+		  } else {
+			  TIM2->CCR1 = 1000;
+			  TIM2->CCR2 = 1000;
+			  TIM2->CCR3 = 1000;
+			  TIM2->CCR4 = 1000;
+		  }
 
 		  checkState();
-		  // Check output values
-		  if (pulse_esc1 > MAX_PULSE_OUTPUT) pulse_esc1 = MAX_PULSE_OUTPUT;
-		  if (pulse_esc1 < MIN_PULSE_OUTPUT) pulse_esc1 = MIN_PULSE_OUTPUT;
-		  if (pulse_esc2 > MAX_PULSE_OUTPUT) pulse_esc2 = MAX_PULSE_OUTPUT;
-		  if (pulse_esc2 < MIN_PULSE_OUTPUT) pulse_esc2 = MIN_PULSE_OUTPUT;
-		  if (pulse_esc3 > MAX_PULSE_OUTPUT) pulse_esc3 = MAX_PULSE_OUTPUT;
-		  if (pulse_esc3 < MIN_PULSE_OUTPUT) pulse_esc3 = MIN_PULSE_OUTPUT;
-		  if (pulse_esc4 > MAX_PULSE_OUTPUT) pulse_esc4 = MAX_PULSE_OUTPUT;
-		  if (pulse_esc4 < MIN_PULSE_OUTPUT) pulse_esc4 = MIN_PULSE_OUTPUT;
-
-		  TIM2->CCR1 = pulse_esc1;
-		  TIM2->CCR2 = pulse_esc3;
-		  TIM2->CCR3 = pulse_esc4;
-		  TIM2->CCR4 = pulse_esc2;
 
 	  }
-	  // Set new motor speeds
 
 
     /* USER CODE END WHILE */
@@ -581,6 +651,7 @@ static void MX_TIM2_Init(void)
 
   /* USER CODE END TIM2_Init 0 */
 
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
   TIM_MasterConfigTypeDef sMasterConfig = {0};
   TIM_OC_InitTypeDef sConfigOC = {0};
 
@@ -590,9 +661,18 @@ static void MX_TIM2_Init(void)
   htim2.Instance = TIM2;
   htim2.Init.Prescaler = 83;
   htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim2.Init.Period = 49999;
+  htim2.Init.Period = 2499;
   htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
   if (HAL_TIM_PWM_Init(&htim2) != HAL_OK)
   {
     Error_Handler();
@@ -739,6 +819,89 @@ static void MX_TIM4_Init(void)
 }
 
 /**
+  * @brief TIM5 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM5_Init(void)
+{
+
+  /* USER CODE BEGIN TIM5_Init 0 */
+
+  /* USER CODE END TIM5_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+
+  /* USER CODE BEGIN TIM5_Init 1 */
+
+  /* USER CODE END TIM5_Init 1 */
+  htim5.Instance = TIM5;
+  htim5.Init.Prescaler = 83;
+  htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim5.Init.Period = 64999;
+  htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim5, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim5, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM5_Init 2 */
+  HAL_TIM_Base_Init(&htim5);
+  HAL_TIM_Base_Start(&htim5);
+  /* USER CODE END TIM5_Init 2 */
+
+}
+
+/**
+  * @brief TIM9 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_TIM9_Init(void)
+{
+
+  /* USER CODE BEGIN TIM9_Init 0 */
+
+  /* USER CODE END TIM9_Init 0 */
+
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+
+  /* USER CODE BEGIN TIM9_Init 1 */
+
+  /* USER CODE END TIM9_Init 1 */
+  htim9.Instance = TIM9;
+  htim9.Init.Prescaler = 83;
+  htim9.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim9.Init.Period = 64999;
+  htim9.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim9.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+  if (HAL_TIM_Base_Init(&htim9) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim9, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN TIM9_Init 2 */
+  /* USER CODE END TIM9_Init 2 */
+
+}
+
+/**
   * @brief GPIO Initialization Function
   * @param None
   * @retval None
@@ -820,11 +983,11 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 float yawErrorFunc(float a, float b) {
-	float temp = (a + b);
-	if (a + b <= 180.0f) return temp;
+	float temp = (a - b);
+	if (temp <= 180.0f && temp >= -180.0f) return temp;
 	else {
 		if (temp > 0) return (temp - 360.0f);
-		else return (360.0f - temp);
+		else return (360.0f + temp);
 	}
 }
 

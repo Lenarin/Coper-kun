@@ -1,8 +1,8 @@
 #include "sd_hal_MPU9250.h"
 #include "main.h"
 
-uint8_t Ascale = AFS_2G;     // AFS_2G, AFS_4G, AFS_8G, AFS_16G
-uint8_t Gscale = GFS_250DPS; // GFS_250DPS, GFS_500DPS, GFS_1000DPS, GFS_2000DPS
+uint8_t Ascale = AFS_2G; //AFS_2G;     // AFS_2G, AFS_4G, AFS_8G, AFS_16G
+uint8_t Gscale = GFS_250DPS; //GFS_250DPS; // GFS_250DPS, GFS_500DPS, GFS_1000DPS, GFS_2000DPS
 uint8_t Mscale = MFS_16BITS; // MFS_14BITS or MFS_16BITS, 14-bit or 16-bit magnetometer resolution
 uint8_t Mmode = 0x06;        // Either 8 Hz 0x02) or 100 Hz (0x06) magnetometer data ODR
 float aRes, gRes, mRes;      // scale resolutions per LSB for the sensors
@@ -23,11 +23,11 @@ int count = 0;  // used to control display output rate
 // parameters for 6 DoF sensor fusion calculations
 float PI = 3.14159265358979323846f;
 float GyroMeasError; // = PI * (60.0f / 180.0f);     // gyroscope measurement error in rads/s (start at 60 deg/s), then reduce after ~10 s to 3
-float beta = 0.5;  // = sqrt(3.0f / 4.0f) * GyroMeasError;  // compute beta
+float beta = 0.7f;//0.5f;  // = sqrt(3.0f / 4.0f) * GyroMeasError;  // compute beta
 float GyroMeasDrift; // = PI * (1.0f / 180.0f);      // gyroscope measurement drift in rad/s/s (start at 0.0 deg/s/s)
-float zeta = 0.01; // = sqrt(3.0f / 4.0f) * GyroMeasDrift;  // compute zeta, the other free parameter in the Madgwick scheme usually set to a small or zero value
-#define Kp 0.5f // these are the free parameters in the Mahony filter and fusion scheme, Kp for proportional feedback, Ki for integral
-#define Ki 0.01f
+float zeta = 0.05f;//0.01f; // = sqrt(3.0f / 4.0f) * GyroMeasDrift;  // compute zeta, the other free parameter in the Madgwick scheme usually set to a small or zero value
+#define Kp 2.0f // these are the free parameters in the Mahony filter and fusion scheme, Kp for proportional feedback, Ki for integral
+#define Ki 0.05f
 
 // imuStruct imuData;
 //float pitch, yaw, roll;
@@ -41,8 +41,12 @@ float MPU9250_deltat; // = 0.0f;                              // integration int
 
 int16_t ax_raw, ay_raw, az_raw, gx_raw, gy_raw, gz_raw, mx_raw, my_raw, mz_raw;
 float ax, ay, az, gx, gy, gz, mx, my, mz;
+float prev_ax, prev_ay;
+float exInt, eyInt, ezInt, q0_last, q1_last, q2_last;
 
 float GyroMeasDriftX = 0, GyroMeasDriftY = 0, GyroMeasDriftZ = 0;
+
+float zAxis[3] = {1, 1, 1}, yAxis[3] = {1, 1, 1}, xAxis[3] = {1, 1, 1};
 
 
 I2C_HandleTypeDef* Handle;
@@ -187,12 +191,12 @@ SD_Result initAK8963()
 	printf("KA8963 WHO AM I = %#x; Must be 0x48\n", c);
 #endif
 
-	magBias[0] = 435;
-	magBias[1] = 534;
-	magBias[2] = -231;
-	magScale[0] = 1.05;
-	magScale[1] = 1.04;
-	magScale[2] = 0.941;
+	magBias[0] = 370.659637;
+	magBias[1] = 175.087387;
+	magBias[2] = -82.175964;
+	magScale[0] = 0.972464;
+	magScale[1] = 0.931944;
+	magScale[2] = 1.112769;
 
 	getMres();
 	return SD_Result_Ok;
@@ -220,14 +224,23 @@ SD_Result SD_MPUInit(SD_Accelerometer AccelerometerSensitivity, SD_Gyroscope Gyr
 	printf("MPU9250 WHO AM I = %#x; Must be 0x71\n", temp);
 #endif
 
-	writeByte(CONFIG, 0x03);
+	//writeByte(CONFIG, 0x03);
+	writeByte(CONFIG, 0x06);
 
-	writeByte(SMPLRT_DIV, 0x01);
+	//writeByte(SMPLRT_DIV, 0x01);
+	writeByte(SMPLRT_DIV, 0x00);
+
+	//uint8_t c =  readByte(GYRO_CONFIG);
+	//writeByte(GYRO_CONFIG, c & ~0xE0); // Clear self-test bits [7:5]
+	//writeByte(GYRO_CONFIG, c & ~0x18); // Clear AFS bits [4:3]
+	//writeByte(GYRO_CONFIG, c | Gscale << 3); // Set full scale range for the gyro
 
 	uint8_t c =  readByte(GYRO_CONFIG);
-	writeByte(GYRO_CONFIG, c & ~0xE0); // Clear self-test bits [7:5]
-	writeByte(GYRO_CONFIG, c & ~0x18); // Clear AFS bits [4:3]
-	writeByte(GYRO_CONFIG, c | Gscale << 3); // Set full scale range for the gyro
+	c = c & ~0x02; // Clear Fchoice bits [1:0]
+	c = c & ~0x18; // Clear AFS bits [4:3]
+	c = c | Gscale << 3; // Set full scale range for the gyro
+	writeByte(GYRO_CONFIG, c );
+
 
 	c =  readByte(ACCEL_CONFIG);
 	writeByte(ACCEL_CONFIG, c & ~0xE0); // Clear self-test bits [7:5]
@@ -389,6 +402,15 @@ void calibrateMPU9250()
    accelBias[0] = (float)accel_bias[0]/(float)accelsensitivity;
    accelBias[1] = (float)accel_bias[1]/(float)accelsensitivity;
    accelBias[2] = (float)accel_bias[2]/(float)accelsensitivity;
+
+#if DEBUG == 1
+   printf("accelBias[0]: %f\n", accelBias[0]);
+   printf("accelBias[1]: %f\n", accelBias[1]);
+   printf("accelBias[2]: %f\n", accelBias[2]);
+   printf("gyroBias[0]: %f\n", gyroBias[0]);
+   printf("gyroBias[1]: %f\n", gyroBias[1]);
+   printf("gyroBias[2]: %f\n", gyroBias[2]);
+#endif
 }
 
 void magcalMPU9250()
@@ -519,6 +541,17 @@ void inline readMagData()
   }
 }
 
+float invSqrt(float x)
+{
+    float halfx = 0.5f * x;
+    float y = x;
+    long i = *(long*)&y;
+    i = 0x5f3759df - (i>>1);
+    y = *(float*)&i;
+    y = y * (1.5f - (halfx * y * y));
+    return y;
+}
+
 void MPU9250_MadgwickQuaternionUpdate(float ax, float ay, float az, float gx,
 		float gy, float gz, float mx, float my, float mz) {
 	float q1 = q[0], q2 = q[1], q3 = q[2], q4 = q[3]; // short name local variable for readability
@@ -553,19 +586,25 @@ void MPU9250_MadgwickQuaternionUpdate(float ax, float ay, float az, float gx,
 
 	if(mx*mx+my*my+mz*mz == 0) MadgwickQuaternionUpdate(ax,ay,az,gx,gy,gz);
 	// Normalise accelerometer measurement
+	/*
 	norm = sqrt(ax * ax + ay * ay + az * az);
 	if (norm == 0.0f)
 		return; // handle NaN
 	norm = 1.0f / norm;
+	*/
+	norm = invSqrt(ax * ax + ay * ay + az * az);
 	ax *= norm;
 	ay *= norm;
 	az *= norm;
 
 	// Normalise magnetometer measurement
+	/*
 	norm = sqrt(mx * mx + my * my + mz * mz);
 	if (norm == 0.0f)
 		return; // handle NaN
 	norm = 1.0f / norm;
+	*/
+	norm = invSqrt(mx * mx + my * my + mz * mz);
 	mx *= norm;
 	my *= norm;
 	mz *= norm;
@@ -618,8 +657,11 @@ void MPU9250_MadgwickQuaternionUpdate(float ax, float ay, float az, float gx,
 					* (_4bx * (q2q3 - q1q4) + _4bz * (q1q2 + q3q4) - my)
 			+ (_4bx * q2)
 					* (_4bx * (q1q3 + q2q4) + _4bz * (0.5 - q2q2 - q3q3) - mz);
+	/*
 	norm = sqrt(s1 * s1 + s2 * s2 + s3 * s3 + s4 * s4); // normalise step magnitude
 	norm = 1.0f / norm;
+	*/
+	norm = invSqrt(s1 * s1 + s2 * s2 + s3 * s3 + s4 * s4);
 	s1 *= norm;
 	s2 *= norm;
 	s3 *= norm;
@@ -640,12 +682,21 @@ void MPU9250_MadgwickQuaternionUpdate(float ax, float ay, float az, float gx,
 	q2 += qDot2 * MPU9250_deltat;
 	q3 += qDot3 * MPU9250_deltat;
 	q4 += qDot4 * MPU9250_deltat;
+	/*
 	norm = sqrt(q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4);  // normalise quaternion
 	norm = 1.0f / norm;
+	*/
+	norm = invSqrt(q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4);
 	q[0] = q1 * norm;
 	q[1] = q2 * norm;
 	q[2] = q3 * norm;
 	q[3] = q4 * norm;
+
+	imuData.yaw = atan2(2.0f * (q[1] * q[2] + q[0] * q[3]),
+			q[0] * q[0] + q[1] * q[1] - q[2] * q[2] - q[3] * q[3]) * 180.0f / PI;
+	imuData.roll = -asin(2.0f * (q[1] * q[3] - q[0] * q[2])) * 180.0f / PI;
+	imuData.pitch = atan2(2.0f * (q[0] * q[1] + q[2] * q[3]),
+			q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3]) * 180.0f / PI;
 
 }
 
@@ -672,10 +723,13 @@ void MadgwickQuaternionUpdate(float ax, float ay, float az, float gx, float gy, 
 	//            float _2q3q4 = 2.0f * q3 * q4;
 
 	// Normalise accelerometer measurement
+	/*
 	norm = sqrt(ax * ax + ay * ay + az * az);
 	if (norm == 0.0f)
 		return; // handle NaN
 	norm = 1.0f / norm;
+	*/
+	norm = invSqrt(ax * ax + ay * ay + az * az);
 	ax *= norm;
 	ay *= norm;
 	az *= norm;
@@ -732,64 +786,140 @@ void MadgwickQuaternionUpdate(float ax, float ay, float az, float gx, float gy, 
 	q4 += (qDot4 - (beta * hatDot4)) * MPU9250_deltat;
 
 	// Normalize the quaternion
+	/*
 	norm = sqrt(q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4);  // normalise quaternion
 	norm = 1.0f / norm;
+	*/
+	norm = invSqrt(q1 * q1 + q2 * q2 + q3 * q3 + q4 * q4);
 	q[0] = q1 * norm;
 	q[1] = q2 * norm;
 	q[2] = q3 * norm;
 	q[3] = q4 * norm;
 
+	imuData.yaw = atan2(2.0f * (q[1] * q[2] + q[0] * q[3]),
+			q[0] * q[0] + q[1] * q[1] - q[2] * q[2] - q[3] * q[3]) * 180.0f / PI;
+	imuData.roll = -asin(2.0f * (q[1] * q[3] - q[0] * q[2])) * 180.0f / PI;
+	imuData.pitch = atan2(2.0f * (q[0] * q[1] + q[2] * q[3]),
+			q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3]) * 180.0f / PI;
+
 }
 
-void CalcGyroDrift() {
-	uint8_t col = 1000;
-	uint32_t gz_sum = 0, gx_sum = 0, gy_sum = 0;
+void gyroCalibration() {
+	uint8_t col = 5000;
+	float gz_sum = 0, gx_sum = 0, gy_sum = 0;
 
+	uint8_t count = 0;
+	while (count < col) {
+		if (readByte(INT_STATUS) & 0x01) {
+			readGyroData();
+			gx = (float) gx_raw * gRes;
+			gy = (float) gy_raw * gRes;
+			gz = (float) gz_raw * gRes;
 
-	for (int i = 0; i < col; i++) {
-		readGyroData();
-		gx = (float) gx_raw * gRes - gyroBias[0];
-		gy = (float) gy_raw * gRes - gyroBias[1];
-		gz = (float) gz_raw * gRes - gyroBias[2];
+			gx_sum += gx;
+			gy_sum += gy;
+			gz_sum += gz;
 
-		gx_sum += gx;
-		gy_sum += gy;
-		gz_sum += gz;
+			count++;
+		}
 	}
 
-	GyroMeasDriftX = (float)gx_sum / (float)col;
-	GyroMeasDriftY = (float)gy_sum / (float)col;
-	GyroMeasDriftZ = (float)gz_sum / (float)col;
+	gyroBias[0] = (float)gx_sum / (float)col;
+	gyroBias[1] = (float)gy_sum / (float)col;
+	gyroBias[2] = (float)gz_sum / (float)col;
+
+#if DEBUG == 1
+	printf("GyroMeasDriftX: %f\n", gyroBias[0]);
+	printf("GyroMeasDriftY: %f\n", gyroBias[1]);
+	printf("GyroMeasDriftZ: %f\n", gyroBias[2]);
+#endif
+
 }
 
-void MPU9250_TakeAndCalcData() {
-	int i;
+void accelCalibration() {
+	uint8_t col = 5000;
+	float az_sum = 0, ax_sum = 0, ay_sum = 0;
 
-	//SD_ReadAccelerometer();
-	//SD_ReadGyroscope();
+	uint8_t count = 0;
+	while (count < col) {
+		if (readByte(INT_STATUS) & 0x01) {
+			readAccelData();
+			ax = (float) ax_raw * aRes;
+			ay = (float) ay_raw * aRes;
+			az = (float) az_raw * aRes;
 
+			//ax = xAxis[0] * ax + yAxis[0] * ay + zAxis[0] * az;
+			//ay = xAxis[1] * ax + yAxis[1] * ay + zAxis[1] * az;
+			//az = xAxis[2] * ax + yAxis[2] * ay + zAxis[2] * az;
+
+			ax_sum += ax;
+			ay_sum += ay;
+			az_sum += az;
+
+			count++;
+		}
+	}
+
+	accelBias[0] = (float)ax_sum / (float)col;
+	accelBias[1] = (float)ay_sum / (float)col;
+	accelBias[2] = (float)az_sum / (float)col + 1;
+
+#if DEBUG == 1
+	printf("AccelMeasDriftX: %f\n", accelBias[0]);
+	printf("AccelMeasDriftY: %f\n", accelBias[1]);
+	printf("AccelMeasDriftZ: %f\n", accelBias[2]);
+#endif
+}
+
+void accelCalibrationEx() {
+	readAccelData();
+	// Calc -g
+	ax = -(float) ax_raw * aRes;
+	ay = -(float) ay_raw * aRes;
+	az = -(float) az_raw * aRes;
+
+	float gnorm = sqrt(ax * ax + ay * ay + az * az);
+
+	zAxis[0] = ax / gnorm;
+	zAxis[1] = ay / gnorm;
+	zAxis[2] = az / gnorm;
+
+	ax = 0;
+	ay = zAxis[2];
+	az = -zAxis[1];
+	gnorm = sqrt(ax * ax + ay * ay + az * az);
+
+	yAxis[0] = ax / gnorm;
+	yAxis[1] = ay / gnorm;
+	yAxis[2] = az / gnorm;
+
+
+	// xAsix = cross(yAxis, zAxis)
+	xAxis[0] = zAxis[1] * yAxis[2] - zAxis[2] * yAxis[1];
+	xAxis[1] = zAxis[2] * yAxis[0] - zAxis[0] * yAxis[2];
+	xAxis[2] = zAxis[0] * yAxis[1] - zAxis[1] * yAxis[0];
+}
+
+void MPU9250_TakeAndCalcData(float dt) {
 	readAccelData();
 	readGyroData();
 	readMagData();
 
-	//	gx_raw -= gx_offset;
-	//	gy_raw -= gy_offset;
-	//	gz_raw -= gz_offset;
-
-	//readAll();
 	ax = (float) ax_raw * aRes - accelBias[0];
-	ay = (float) ay_raw * aRes - accelBias[1];
-	az = (float) az_raw * aRes - accelBias[2];
+	ay = (float) ay_raw * aRes - accelBias[0];
+	az = (float) az_raw * aRes - accelBias[0];
 
-	gx = (float) gx_raw * gRes - gyroBias[0] - GyroMeasDriftX;
-	gy = (float) gy_raw * gRes - gyroBias[1] - GyroMeasDriftY;
-	gz = (float) gz_raw * gRes - gyroBias[2] - GyroMeasDriftZ;
+	//ax = xAxis[0] * ax + yAxis[0] * ay + zAxis[0] * az - accelBias[0];
+	//ay = xAxis[1] * ax + yAxis[1] * ay + zAxis[1] * az - accelBias[1];
+	//az = xAxis[2] * ax + yAxis[2] * ay + zAxis[2] * az - accelBias[2];
 
-	/*
-	gx = 0.9*gx + 0.1*ax;
-	gx = 0.9*gy + 0.1*ay;
-	gx = 0.9*gz + 0.1*az;
-*/
+	gx = (float) gx_raw * gRes - gyroBias[0];
+	gy = (float) gy_raw * gRes - gyroBias[1];
+	gz = (float) gz_raw * gRes - gyroBias[2];
+
+	gx_out = gx;
+	gy_out = gy;
+	gz_out = gz;
 
 	mx = (float)mx_raw * mRes * magCalibration[0] - magBias[0] ;
 	my = (float)my_raw * mRes * magCalibration[1] - magBias[1] ;
@@ -797,30 +927,116 @@ void MPU9250_TakeAndCalcData() {
 	//printf("%f %f %f\n",mx,my,mz);
 
 
-	MPU9250_now = HAL_GetTick();
-	MPU9250_deltat = (float) ((MPU9250_now - MPU9250_lastUpdate) / 1000.0f); // set integration time by time elapsed since last filter update
-	MPU9250_lastUpdate = MPU9250_now;
 
-	 //MadgwickQuaternionUpdate(ax, ay, az, gx * PI / 180.0f, gy * PI / 180.0f, gz * PI / 180.0f);
+	//MPU9250_now = HAL_GetTick();
+	//MPU9250_deltat = (float) ((MPU9250_now - MPU9250_lastUpdate) / 1000.0f); // set integration time by time elapsed since last filter update
+	//MPU9250_lastUpdate = MPU9250_now;
+
+
+	MPU9250_deltat = dt;
+
+}
+
+void AHRS_Update(float gx, float gy, float gz, float ax, float ay, float az, float mx, float my, float mz)
+{
+    float norm;
+    float hx, hy, hz, bz, by;
+    float vx, vy, vz, wx, wy, wz;
+    float ex, ey, ez;
+    float q0_last, q1_last, q2_last;
+
+    //auxiliary variables to reduce number of repeated operations
+    float q0q0 = q[0]*q[0];
+    float q0q1 = q[0]*q[1];
+    float q0q2 = q[0]*q[2];
+    float q0q3 = q[0]*q[3];
+    float q1q1 = q[1]*q[1];
+    float q1q2 = q[1]*q[2];
+    float q1q3 = q[1]*q[3];
+    float q2q2 = q[2]*q[2];
+    float q2q3 = q[2]*q[3];
+    float q3q3 = q[3]*q[3];
+
+    //normalise the measurements
+    norm = invSqrt(ax*ax + ay*ay + az*az);
+    ax = ax * norm;
+    ay = ay * norm;
+    az = az * norm;
+    norm = invSqrt(mx*mx + my*my + mz*mz);
+    mx = mx * norm;
+    my = my * norm;
+    mz = mz * norm;
+
+    //compute reference direction of flux
+    hx = 2*mx*(0.5 - q2q2 - q3q3) + 2*my*(q1q2 - q0q3) + 2*mz*(q1q3 + q0q2);
+    hy = 2*mx*(q1q2 + q0q3) + 2*my*(0.5 - q1q1 - q3q3) + 2*mz*(q2q3 - q0q1);
+    hz = 2*mx*(q1q3 - q0q2) + 2*my*(q2q3 + q0q1) + 2*mz*(0.5 - q1q1 - q2q2);
+
+    // bx = sqrtf((hx*hx) + (hy*hy));
+    by = sqrtf((hx*hx) + (hy*hy));
+    bz = hz;
+
+    // estimated direction of gravity and flux (v and w)
+    vx = 2*(q1q3 - q0q2);
+    vy = 2*(q0q1 + q2q3);
+    vz = q0q0 - q1q1 - q2q2 + q3q3;
+
+    wx = 2*by*(q1q2 + q0q3) + 2*bz*(q1q3 - q0q2);
+    wy = 2*by*(0.5 - q1q1 - q3q3) + 2*bz*(q0q1 + q2q3);
+    wz = 2*by*(q2q3 - q0q1) + 2*bz*(0.5 - q1q1 - q2q2);
+
+    // error is sum of cross product between reference direction of fields and direction measured by sensors
+    ex = (ay*vz - az*vy) + (my*wz - mz*wy);
+    ey = (az*vx - ax*vz) + (mz*wx - mx*wz);
+    ez = (ax*vy - ay*vx) + (mx*wy - my*wx);
+
+    if(ex != 0.0f && ey != 0.0f && ez != 0.0f)
+    {
+        // integral error scaled integral gain
+        exInt = exInt + ex*Ki * MPU9250_deltat;
+        eyInt = eyInt + ey*Ki * MPU9250_deltat;
+        ezInt = ezInt + ez*Ki * MPU9250_deltat;
+
+        // adjusted gyroscope measurements
+        gx = gx + Kp*ex + exInt;
+        gy = gy + Kp*ey + eyInt;
+        gz = gz + Kp*ez + ezInt;
+    }
+
+    // save quaternion
+    q0_last = q[0];
+    q1_last = q[1];
+    q2_last = q[2];
+
+    // integrate quaternion rate and normalise (Picard first order)
+    q[0] = q0_last + (-q1_last*gx - q2_last*gy - q[3]*gz) * MPU9250_deltat;
+    q[1] = q1_last + ( q0_last*gx + q2_last*gz - q[3]*gy) * MPU9250_deltat;
+    q[2] = q2_last + ( q0_last*gy - q1_last*gz + q[3]*gx) * MPU9250_deltat;
+    q[3] = q[3] + ( q0_last*gz + q1_last*gy - q2_last*gx) * MPU9250_deltat;
+
+    // normalise quaternion
+    norm = invSqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+    q[0] = q[0] * norm;    //w
+    q[1] = q[1] * norm;    //x
+    q[2] = q[2] * norm;    //y
+    q[3] = q[3] * norm;    //z
+
+    // Quaternion to euler angle
+    imuData.roll  =  -asin(2*q[0]*q[2] - 2*q[1]*q[3]) * 180.0f / PI;
+    imuData.pitch =  atan2(2*q[0]*q[1] + 2*q[2]*q[3], 1 - 2*q[1]*q[1] - 2*q[2]*q[2]) * 180.0f / PI;
+    imuData.yaw   =  atan2(2*q[1]*q[2] + 2*q[0]*q[3], 1 - 2*q[2]*q[2] - 2*q[3]*q[3]) * 180.0f / PI;
 
 }
 
 void MPU9250_CalcYPR() {
-	MPU9250_MadgwickQuaternionUpdate(-ax, ay, az, gx*PI/180.0f, -gy*PI/180.0f, -gz*PI/180.0f, my, -mx, mz);
+	MPU9250_MadgwickQuaternionUpdate(ax, -ay, -az, gx*PI/180.0f, -gy*PI/180.0f, -gz*PI/180.0f, -my, mx, -mz);
+	//MadgwickQuaternionUpdate(ax, -ay, -az, gx*PI/180.0f, -gy*PI/180.0f, -gz*PI/180.0f);
+	//AHRS_Update(gx*PI/180.0f, -gy*PI/180.0f, -gz*PI/180.0f, -ax, ay, az, -mx, my, mz);
 
-	imuData.yaw = atan2(2.0f * (q[1] * q[2] + q[0] * q[3]),
-			q[0] * q[0] + q[1] * q[1] - q[2] * q[2] - q[3] * q[3]);
-	imuData.pitch = -asin(2.0f * (q[1] * q[3] - q[0] * q[2]));
-	imuData.roll = atan2(2.0f * (q[0] * q[1] + q[2] * q[3]),
-			q[0] * q[0] - q[1] * q[1] - q[2] * q[2] + q[3] * q[3]);
-	imuData.pitch *= 180.0f / PI;
-	imuData.yaw *= 180.0f / PI;
-	imuData.roll *= 180.0f / PI;
-
-	//imuData.yaw = imuData.yaw * 0.8 + 0.2 * ( gz_raw / SSF_GYRO);
-	//dz = 0.7 * dz + 0.3 * gz_raw / SSF_GYRO;
 }
 
 imuStruct* imuGetPtr() {
 	return &imuData;
 }
+
+
